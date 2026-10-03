@@ -5,8 +5,12 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { cloudVertex, cloudFragment } from './cloud-shader.js';
 import { QUALITIES, initialQuality } from './render-quality.js';
+import { CinematicShader } from './cinematic-shader.js';
+import { ContactAO } from './contact-ao.js';
+import { buildSky, buildLandscape, buildSpray, buildRain, makeSurfaceTextures } from './scenic-world.js';
 
 const V = (x,y,z) => new THREE.Vector3(x,y,z);
 const noise = new ImprovedNoise();
@@ -20,13 +24,13 @@ export class StormScene {
   constructor(container,label) {
     this.container=container; this.label=label;
     this.scene=new THREE.Scene();
-    this.scene.background=new THREE.Color(0x152534);
-    this.scene.fog=new THREE.FogExp2(0x152534,.015);
+    this.scene.background=new THREE.Color(0x101c29);
+    this.scene.fog=new THREE.FogExp2(0x344653,.011);
     this.camera=new THREE.PerspectiveCamera(35,1,.15,130);
     this.renderer=new THREE.WebGLRenderer({antialias:true,alpha:false,powerPreference:'high-performance'});
     this.renderer.outputColorSpace=THREE.SRGBColorSpace;
     this.renderer.toneMapping=THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure=1.12;
+    this.renderer.toneMappingExposure=1.24;
     this.renderer.shadowMap.enabled=true;
     this.renderer.shadowMap.type=THREE.PCFSoftShadowMap;
     container.append(this.renderer.domElement);
@@ -42,6 +46,7 @@ export class StormScene {
     this.dirty=true;this.controls.addEventListener('change',()=>{this.dirty=true;});
     this.resetCamera();
     this.buildLighting();
+    buildSky(this);
     this.buildTerrain();
     this.buildAtmosphere();
     this.buildClouds();
@@ -52,12 +57,16 @@ export class StormScene {
     this.setStudy(false);
     this.composer=new EffectComposer(this.renderer);
     this.composer.addPass(new RenderPass(this.scene,this.camera));
-    this.bloom=new UnrealBloomPass(new THREE.Vector2(800,500),.14,.45,1.1);
-    this.composer.addPass(this.bloom);this.composer.addPass(new OutputPass());
+    this.ao=new ContactAO(this);this.composer.addPass(this.ao);
+    this.bloom=new UnrealBloomPass(new THREE.Vector2(800,500),.20,.6,1.15);
+    this.composer.addPass(this.bloom);
+    this.grade=new ShaderPass(CinematicShader);this.grade.uniforms.uResolution.value=new THREE.Vector2(800,500);
+    this.composer.addPass(this.grade);this.composer.addPass(new OutputPass());
     this.cutawayLabel=document.createElement('div');this.cutawayLabel.className='cutaway-label';this.cutawayLabel.hidden=true;container.parentElement.append(this.cutawayLabel);
     this.stats={fps:0,frames:0,since:performance.now(),last:performance.now(),cpuSamples:[]};
     this.setQuality(this.quality,false);
     this.resizeObserver=new ResizeObserver(()=>this.resize());this.resizeObserver.observe(container);this.resize();
+    this.setCameraView('storm');
     this.renderer.domElement.addEventListener('webglcontextlost',e=>{e.preventDefault();this.contextLost=true;container.dispatchEvent(new CustomEvent('render-status',{detail:'การแสดงผล 3D หยุดชั่วคราว กรุณาโหลดหน้าใหม่'}));});
     this.renderer.domElement.addEventListener('webglcontextrestored',()=>{this.contextLost=false;});
   }
@@ -68,61 +77,51 @@ export class StormScene {
     const material=dashed?new THREE.LineDashedMaterial({color,opacity,transparent:true,dashSize:.16,gapSize:.17}):new THREE.LineBasicMaterial({color,opacity,transparent:true});
     const line=new THREE.Line(geometry,material);if(dashed)line.computeLineDistances();group.add(line);return line;
   }
-  resetCamera() {this.followHail=false;this.controls.minDistance=9;this.camera.position.set(19.5,11.7,24.5);this.controls.target.set(-.1,7.2,0);this.controls.update();this.dirty=true;}
+  resetCamera() {this.cameraView='overview';this.followHail=false;this.controls.minDistance=9;this.controls.maxPolarAngle=Math.PI*.53;this.camera.fov=35;this.camera.updateProjectionMatrix();this.camera.position.set(19.5,11.7,24.5);this.controls.target.set(-.1,7.2,0);this.controls.update();this.dirty=true;}
+  setCameraView(mode){
+    if(this.followHail)this.setCloseup(false);
+    this.cameraView=mode;this.controls.minDistance=mode==='ground'?2:9;this.controls.maxPolarAngle=mode==='ground'?2.5:1.9;
+    if(mode==='ground'){this.camera.fov=62;this.camera.position.set(7,1.35,9);this.controls.target.set(-.6,8,-.5);}
+    else if(mode==='storm'||mode==='orbit'){this.camera.fov=45;this.camera.position.set(12,3.8,23);this.controls.target.set(-.3,7.2,0);}
+    else{this.resetCamera();}
+    this.camera.updateProjectionMatrix();this.controls.update();this.dirty=true;
+  }
   setCloseup(enabled) {
+    if(enabled&&this.followHail)return;
     this.followHail=enabled;
     if(enabled){
-      this.closeupVisibility={clouds:this.clouds.visible,weather:this.weather.visible,flows:this.flows.visible,trail:this.trail.visible};
-      this.clouds.visible=this.weather.visible=this.flows.visible=this.trail.visible=false;
+      this.savedCamera={view:this.cameraView,position:this.camera.position.clone(),target:this.controls.target.clone(),fov:this.camera.fov};
+      this.closeupVisibility={clouds:this.clouds.visible,weather:this.weather.visible,flows:this.flows.visible,trail:this.trail.visible,terrain:this.terrain.visible,horizon:this.horizon.visible,sky:this.sky.visible};
+      this.clouds.visible=this.weather.visible=this.flows.visible=this.trail.visible=this.terrain.visible=this.horizon.visible=this.sky.visible=false;
+      this.studio.visible=true;this.scene.background.setHex(0x121c27);this.scene.fog.density=0;
+      this.camera.fov=32;this.camera.updateProjectionMatrix();
       this.controls.minDistance=.8;this.controls.target.copy(this.hail.position);this.camera.position.copy(this.hail.position).add(V(1.1,.5,1.9));this.controls.update();this.atmosphere.visible=false;
     }
-    else {this.restoreVisibility();this.resetCamera();this.atmosphere.visible=this.study;}
+    else {this.restoreVisibility();this.studio.visible=false;this.scene.fog.density=.011;this.resetCamera();this.atmosphere.visible=this.study;
+      if(this.savedCamera){const c=this.savedCamera;this.cameraView=c.view;this.camera.position.copy(c.position);this.controls.target.copy(c.target);this.camera.fov=c.fov;this.camera.updateProjectionMatrix();this.controls.minDistance=c.view==='ground'?2:9;this.controls.maxPolarAngle=c.view==='ground'?2.5:c.view==='overview'?Math.PI*.53:1.9;this.controls.update();this.savedCamera=null;}
+    }
     this.dirty=true;
   }
-  restoreVisibility(){if(!this.closeupVisibility)return;for(const key of ['clouds','weather','flows','trail'])this[key].visible=this.closeupVisibility[key];this.closeupVisibility=null;}
+  restoreVisibility(){if(!this.closeupVisibility)return;for(const [key,visible]of Object.entries(this.closeupVisibility))this[key].visible=visible;this.closeupVisibility=null;}
   buildLighting() {
-    this.scene.add(new THREE.HemisphereLight(0xb4d2ef,0x363a34,1.1));
-    this.sun=new THREE.DirectionalLight(0xe1edff,2.3);this.sun.position.set(-10,20,9);this.sun.castShadow=true;
+    this.scene.add(new THREE.HemisphereLight(0xb2c9ed,0x474038,.9));
+    this.sun=new THREE.DirectionalLight(0xffd5a0,3.4);this.sun.position.set(-16,19,-9);this.sun.castShadow=true;
     Object.assign(this.sun.shadow.camera,{left:-12,right:12,top:18,bottom:-7,near:1,far:50});
     this.sun.shadow.bias=-.0004;this.sun.shadow.normalBias=.04;this.sun.shadow.radius=3;this.scene.add(this.sun);
-    const rim=new THREE.DirectionalLight(0x829cc5,.7);rim.position.set(8,10,-9);this.scene.add(rim);
+    const rim=new THREE.DirectionalLight(0x93b5ed,1.0);rim.position.set(8,10,9);this.scene.add(rim);
     this.flashLight=new THREE.PointLight(0xbbd4ff,0,21,1.6);this.flashLight.position.set(.7,4,0);this.scene.add(this.flashLight);
     const canvas=document.createElement('canvas');canvas.width=1024;canvas.height=512;const ctx=canvas.getContext('2d');
     const g=ctx.createLinearGradient(0,0,0,512);g.addColorStop(0,'#7c98b1');g.addColorStop(.46,'#c9d6dc');g.addColorStop(.54,'#657d86');g.addColorStop(1,'#1c2428');ctx.fillStyle=g;ctx.fillRect(0,0,1024,512);
     const light=ctx.createRadialGradient(280,145,0,280,145,110);light.addColorStop(0,'rgba(255,255,255,1)');light.addColorStop(.2,'rgba(242,249,255,.85)');light.addColorStop(1,'rgba(242,249,255,0)');ctx.fillStyle=light;ctx.fillRect(0,0,1024,512);
     const tex=new THREE.CanvasTexture(canvas);tex.mapping=THREE.EquirectangularReflectionMapping;tex.colorSpace=THREE.SRGBColorSpace;
     const pmrem=new THREE.PMREMGenerator(this.renderer);this.environment=pmrem.fromEquirectangular(tex);this.scene.environment=this.environment.texture;tex.dispose();pmrem.dispose();
+    this.studio=new THREE.Group();this.scene.add(this.studio);this.studio.visible=false;
+    for(const [color,intensity,position]of [[0xe8f6ff,3.5,[-3,5,4]],[0x82adcf,2,[4,2,-3]],[0xffe9c4,1.8,[-2,-1,-3]]]){
+      const light=new THREE.DirectionalLight(color,intensity);light.position.set(...position);this.studio.add(light);this.studio.add(light.target);
+    }
   }
   groundHeight(x,z) {const back=clamp((-z-1)/5);return .045+back*(.35+noise.noise(x*.32,0,z*.4)*1.1)+Math.pow(back,2)*(1.5+Math.sin(x*.8+1)*.65);}
-  buildTerrain() {
-    this.terrain=new THREE.Group();this.scene.add(this.terrain);
-    const geo=new THREE.PlaneGeometry(15,11,160,120);geo.rotateX(-Math.PI/2);
-    const pos=geo.attributes.position,colors=[];
-    const moss=new THREE.Color(0x3e5143),earth=new THREE.Color(0x53564b),low=new THREE.Color(0x253a35),color=new THREE.Color();
-    for(let i=0;i<pos.count;i++){const x=pos.getX(i),z=pos.getZ(i),h=this.groundHeight(x,z);pos.setY(i,h);const n=noise.noise(x*1.2,2,z*1.2)*.5+.5;color.copy(low).lerp(moss,n).lerp(earth,clamp(h*.7));colors.push(color.r,color.g,color.b);}
-    geo.setAttribute('color',new THREE.Float32BufferAttribute(colors,3));geo.computeVertexNormals();
-    const grain=document.createElement('canvas');grain.width=512;grain.height=512;const ctx=grain.getContext('2d'),image=ctx.createImageData(512,512);
-    for(let i=0;i<image.data.length;i+=4){const n=125+random()*90;image.data[i]=n;image.data[i+1]=n;image.data[i+2]=n;image.data[i+3]=255;}ctx.putImageData(image,0,0);
-    this.groundTexture=new THREE.CanvasTexture(grain);this.groundTexture.wrapS=this.groundTexture.wrapT=THREE.RepeatWrapping;this.groundTexture.repeat.set(12,9);this.groundTexture.anisotropy=Math.min(8,this.renderer.capabilities.getMaxAnisotropy());
-    const ground=this.mesh(geo,this.material(0xffffff,{vertexColors:true,bumpMap:this.groundTexture,bumpScale:.035,roughness:.57,metalness:.05}),0,0,0,this.terrain);ground.receiveShadow=true;
-    this.mesh(new THREE.BoxGeometry(15,.28,11),this.material(0x202d2d),0,-.11,0,this.terrain);
-    this.line([V(-7.5,-.01,-5.5),V(7.5,-.01,-5.5),V(7.5,-.01,5.5),V(-7.5,-.01,5.5),V(-7.5,-.01,-5.5)],0x7b9995,.3,this.terrain);
-    // Smooth vegetation crowns replace the original cone-shaped trees.
-    const crownGeo=new THREE.IcosahedronGeometry(1,2),trunkMat=this.material(0x413c32),foliage=[this.material(0x344a3a),this.material(0x455744),this.material(0x283f34)];
-    for(let i=0;i<46;i++) {
-      const x=(random()-.5)*13.5,z=(random()-.5)*9;if(x>1.8&&x<4.1&&z>-.5&&z<2)continue;
-      const h=this.groundHeight(x,z),size=.13+random()*.15;
-      const trunk=this.mesh(new THREE.CylinderGeometry(.025,.04,.47,6),trunkMat,x,h+.2,z,this.terrain);trunk.castShadow=true;
-      for(let j=0;j<3;j++){const crown=this.mesh(crownGeo,foliage[i%3],x+(random()-.5)*.2,h+.4+random()*.17,z+(random()-.5)*.2,this.terrain);crown.scale.set(size*1.1,size*1.6,size);crown.castShadow=true;}
-    }
-    const grassGeo=new THREE.BufferGeometry(),grassPositions=[];
-    for(let i=0;i<2600;i++){const x=(random()-.5)*14.4,z=(random()-.5)*10,h=this.groundHeight(x,z);grassPositions.push(x,h,z,x+.015,h+.035+random()*.06,z+.01);}
-    grassGeo.setAttribute('position',new THREE.Float32BufferAttribute(grassPositions,3));const grass=new THREE.LineSegments(grassGeo,new THREE.LineBasicMaterial({color:0x809082,transparent:true,opacity:.26}));this.terrain.add(grass);
-    const puddleMat=new THREE.MeshPhysicalMaterial({color:0x445862,roughness:.085,metalness:.25,clearcoat:1,clearcoatRoughness:.07,transparent:true,opacity:.83});
-    for(let i=0;i<12;i++){const x=(random()-.5)*11,z=1+random()*3.7;const puddle=this.mesh(new THREE.CircleGeometry(.23+random()*.46,40),puddleMat,x,this.groundHeight(x,z)+.007,z,this.terrain);puddle.rotation.x=-Math.PI/2;puddle.scale.set(1.6,1,1);}
-    this.impact=new THREE.Group();this.scene.add(this.impact);
-    for(let i=0;i<3;i++){const ring=this.mesh(new THREE.RingGeometry(.96,1,80),new THREE.MeshBasicMaterial({color:0xd4e2e9,side:THREE.DoubleSide,transparent:true,opacity:.35,depthWrite:false}),3,.063+i*.004,.5,this.impact);ring.rotation.x=-Math.PI/2;}
-  }
+  buildTerrain() { buildLandscape(this,random); }
   buildAtmosphere() {
     this.atmosphere=new THREE.Group();this.scene.add(this.atmosphere);
     for(const [y,color] of [[5,0x6cabb4],[10,0x839ab3],[15,0x809eb8]])this.line([V(-6,y,-4),V(6,y,-4),V(6,y,4),V(-6,y,4),V(-6,y,-4)],color,.18,this.atmosphere,true);
@@ -130,10 +129,11 @@ export class StormScene {
   }
   buildClouds() {
     this.clouds=new THREE.Group();this.scene.add(this.clouds);
-    this.cloudUniforms={uDensity:{value:null},uCamera:{value:new THREE.Vector3()},uHail:{value:new THREE.Vector3()},uTime:{value:0},uStudy:{value:0},uFlash:{value:0},uSteps:{value:this.profile.steps},uLightSteps:{value:this.profile.lightSteps}};
+    this.cloudUniforms={uDensity:{value:null},uDetail:{value:null},uCamera:{value:new THREE.Vector3()},uHail:{value:new THREE.Vector3()},uTime:{value:0},uStudy:{value:0},uFlash:{value:0},uSteps:{value:this.profile.steps},uLightSteps:{value:this.profile.lightSteps}};
     const mat=new THREE.ShaderMaterial({glslVersion:THREE.GLSL3,vertexShader:cloudVertex,fragmentShader:cloudFragment,uniforms:this.cloudUniforms,side:THREE.BackSide,transparent:true,depthWrite:false,depthTest:true});
     this.volume=this.mesh(new THREE.BoxGeometry(1,1,1),mat,-.5,8.5,0,this.clouds);this.volume.scale.set(13,15,9);this.volume.renderOrder=2;this.volume.visible=false;
-    this.ready=new Promise((resolve,reject)=>{this.cloudWorker=new Worker(new URL('./cloud-worker.js',import.meta.url),{type:'module'});this.cloudWorker.onmessage=({data})=>{const tex=new THREE.Data3DTexture(data.data,data.width,data.height,data.depth);tex.format=THREE.RedFormat;tex.type=THREE.UnsignedByteType;tex.minFilter=tex.magFilter=THREE.LinearFilter;tex.unpackAlignment=1;tex.needsUpdate=true;this.cloudUniforms.uDensity.value=tex;this.volume.visible=true;this.cloudWorker.terminate();this.cloudReady=true;this.dirty=true;resolve();};this.cloudWorker.onerror=e=>{this.cloudWorker.terminate();reject(new Error(e.message||'ไม่สามารถสร้างเมฆปริมาตรได้'));};this.cloudWorker.postMessage({});});
+    this.volume.onBeforeRender=(_renderer,_scene,camera)=>{this.cloudUniforms.uCamera.value.copy(camera.position);this.volume.worldToLocal(this.cloudUniforms.uCamera.value);};
+    this.ready=new Promise((resolve,reject)=>{this.cloudWorker=new Worker(new URL('./cloud-worker.js',import.meta.url),{type:'module'});this.cloudWorker.onmessage=({data})=>{const tex=new THREE.Data3DTexture(data.data,data.width,data.height,data.depth);tex.format=THREE.RedFormat;tex.type=THREE.UnsignedByteType;tex.minFilter=tex.magFilter=THREE.LinearFilter;tex.unpackAlignment=1;tex.needsUpdate=true;this.cloudUniforms.uDensity.value=tex;const detailTex=new THREE.Data3DTexture(data.detail,data.detailSize,data.detailSize,data.detailSize);detailTex.format=THREE.RedFormat;detailTex.type=THREE.UnsignedByteType;detailTex.minFilter=detailTex.magFilter=THREE.LinearFilter;detailTex.wrapS=detailTex.wrapT=detailTex.wrapR=THREE.RepeatWrapping;detailTex.unpackAlignment=1;detailTex.needsUpdate=true;this.cloudUniforms.uDetail.value=detailTex;this.volume.visible=true;this.cloudWorker.terminate();this.cloudReady=true;this.dirty=true;resolve();};this.cloudWorker.onerror=e=>{this.cloudWorker.terminate();reject(new Error(e.message||'ไม่สามารถสร้างเมฆปริมาตรได้'));};this.cloudWorker.postMessage({});});
   }
   buildFlows() {
     this.flows=new THREE.Group();this.scene.add(this.flows);this.flowParticles=[];
@@ -152,9 +152,13 @@ export class StormScene {
   }
   buildHail() {
     this.hail=new THREE.Group();this.scene.add(this.hail);
-    this.iceMaterial=new THREE.MeshPhysicalMaterial({color:0xd2e4ec,roughness:.21,metalness:0,transmission:.53,thickness:.85,ior:1.31,attenuationColor:new THREE.Color(0xb0d4e2),attenuationDistance:2.2,clearcoat:.8,clearcoatRoughness:.13,envMapIntensity:1.3,depthTest:false});
+    const [iceMap,iceBump,iceRough]=makeSurfaceTextures(this.renderer,'ice');
+    this.iceMaterial=new THREE.MeshPhysicalMaterial({color:0xe6f2f5,map:iceMap,bumpMap:iceBump,bumpScale:.032,roughnessMap:iceRough,roughness:.46,metalness:0,transmission:.68,thickness:1.2,ior:1.31,attenuationColor:new THREE.Color(0xb8d6df),attenuationDistance:2.8,clearcoat:1,clearcoatRoughness:.065,envMapIntensity:1.55,depthTest:false});
     this.hailCore=this.mesh(this.iceGeometry(),this.iceMaterial,0,0,0,this.hail);this.hailCore.renderOrder=7;
-    this.iceNucleus=this.mesh(new THREE.IcosahedronGeometry(.58,3),this.material(0xe3ebed,{roughness:.74,transparent:true,opacity:.7,depthTest:false}),0,0,0,this.hail);this.iceNucleus.renderOrder=6;
+    this.iceNucleus=this.mesh(this.iceGeometry(.48),this.material(0xe3ebed,{bumpMap:iceBump,bumpScale:.06,roughness:.74,transparent:true,opacity:.68,depthTest:false}),0,0,0,this.hail);this.iceNucleus.renderOrder=6;
+    for(const radius of [.68,.84]){
+      const shell=this.mesh(new THREE.SphereGeometry(radius,48,32),this.material(0xcbdfe4,{roughness:.65,transparent:true,opacity:.10,depthWrite:false,depthTest:false,bumpMap:iceBump,bumpScale:.02}),0,0,0,this.hail);shell.renderOrder=6;
+    }
     this.bubbles=new THREE.InstancedMesh(new THREE.SphereGeometry(1,6,4),this.material(0xf1f6f7,{roughness:.63,transparent:true,opacity:.55,depthTest:false}),100);this.bubbles.renderOrder=6;this.hail.add(this.bubbles);
     for(let i=0;i<100;i++){const direction=V(random()-.5,random()-.5,random()-.5).normalize();dummy.position.copy(direction).multiplyScalar(.78*Math.cbrt(random()));dummy.scale.setScalar(.008+random()*.021);dummy.updateMatrix();this.bubbles.setMatrixAt(i,dummy.matrix);}
     this.iceCracks=new THREE.Group();this.hail.add(this.iceCracks);
@@ -168,15 +172,17 @@ export class StormScene {
   buildWeather() {
     this.weather=new THREE.Group();this.scene.add(this.weather);
     this.weatherSeeds=Array.from({length:3200},()=>({x:(random()-.5)*10,z:(random()-.5)*7,phase:random(),length:.1+random()*.18}));
-    this.rainBuffer=new Float32Array(3200*6);this.rainGeo=new THREE.BufferGeometry();this.rainGeo.setAttribute('position',new THREE.BufferAttribute(this.rainBuffer,3).setUsage(THREE.DynamicDrawUsage));
-    this.rain=new THREE.LineSegments(this.rainGeo,new THREE.LineBasicMaterial({color:0xa3bdcc,transparent:true,opacity:.22,depthWrite:false}));this.weather.add(this.rain);
+    buildRain(this);
     this.smallHail=new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1,1),this.material(0xd8e7ec,{roughness:.35}),180);this.smallHail.instanceMatrix.setUsage(THREE.DynamicDrawUsage);this.weather.add(this.smallHail);
     this.lightning=new THREE.Group();this.weather.add(this.lightning);
-    const bolt=[V(.7,4.5,-.3),V(.5,3.8,-.4),V(.93,3.1,-.3),V(.6,2.5,-.15),V(1.15,2.7,-.12),V(.9,1.7,0),V(1.4,.05,.2)];
-    const curve=new THREE.CatmullRomCurve3(bolt,false,'catmullrom',0);
-    this.mesh(new THREE.TubeGeometry(curve,32,.015,5,false),new THREE.MeshBasicMaterial({color:0xd3e3ff,toneMapped:false}),0,0,0,this.lightning);
-    this.line([bolt[2],V(.2,2.9,-.3),V(.05,2.4,-.3),V(-.4,2.2,-.3)],0xc2d7ff,.8,this.lightning);
+    const bolt=[V(.3,9.5,-.5),V(-.2,8.4,-.4),V(.6,7.6,-.5),V(.2,6.7,-.3),V(.9,6.2,-.4),V(.5,5.1,-.3),V(.7,4.5,-.3),V(.5,3.8,-.4),V(.93,3.1,-.3),V(.6,2.5,-.15),V(1.15,2.7,-.12),V(.9,1.7,0),V(1.4,.05,.2)];
+    for(const points of [bolt,[bolt[2],V(-.4,6.5,-.5),V(-.7,6.2,-.4),V(-.55,5.5,-.3),V(-1.2,4.8,-.2)],[bolt[8],V(.2,2.9,-.3),V(.05,2.4,-.3),V(-.4,2.2,-.3)]]){
+      const path=new THREE.CurvePath();for(let i=1;i<points.length;i++)path.add(new THREE.LineCurve3(points[i-1],points[i]));
+      this.mesh(new THREE.TubeGeometry(path,points.length*4,.012,5,false),new THREE.MeshBasicMaterial({color:0xeaf4ff,toneMapped:false}),0,0,0,this.lightning);
+      this.mesh(new THREE.TubeGeometry(path,points.length*4,.045,5,false),new THREE.MeshBasicMaterial({color:0x6da5ff,transparent:true,opacity:.16,blending:THREE.AdditiveBlending,depthWrite:false,toneMapped:false}),0,0,0,this.lightning);
+    }
     this.lightning.visible=false;
+    buildSpray(this,random);
   }
   buildCutaway() {
     this.cutaway=new THREE.Group();this.cutaway.position.set(4.6,8,3.5);this.scene.add(this.cutaway);
@@ -195,12 +201,17 @@ export class StormScene {
     this.quality=name;this.profile=QUALITIES[name];
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,this.profile.pixelRatio));
     this.cloudUniforms.uSteps.value=this.profile.steps;this.cloudUniforms.uLightSteps.value=this.profile.lightSteps;
-    this.rainGeo.setDrawRange(0,this.profile.particles*2);this.bloom.enabled=this.profile.bloom;
+    this.rainGeo.instanceCount=this.profile.particles;this.bloom.enabled=this.profile.bloom;this.ao.enabled=this.profile.ao;
+    this.grass.count=this.profile.grass;this.spray.geometry.setDrawRange(0,this.profile.spray);
+    this.spray.material.uniforms.uRatio.value=this.renderer.getPixelRatio();
+    this.water.visible=this.profile.reflections;this.water.getRenderTarget().setSize(this.profile.reflectionSize,this.profile.reflectionSize);
     const size=this.profile.shadows;
     if(this.sun.shadow.mapSize.x!==size){this.sun.shadow.mapSize.set(size,size);this.sun.shadow.map?.dispose();this.sun.shadow.map=null;this.sun.shadow.needsUpdate=true;}
     this.renderer.domElement.dataset.quality=name;
     this.renderer.domElement.dataset.gpu=this.gpuName;
     this.renderer.domElement.dataset.cloudSteps=String(this.profile.steps);
+    this.renderer.domElement.dataset.rendererVersion='cinematic-2';
+    this.renderer.domElement.dataset.reflections=String(this.profile.reflections);
     if(persist)try{localStorage.setItem('lookhep-quality',name);}catch{}
     this.resize();
   }
@@ -211,17 +222,23 @@ export class StormScene {
     const {width,height}=this.container.getBoundingClientRect();this.width=width;this.height=height;
     this.camera.aspect=width/Math.max(1,height);this.camera.updateProjectionMatrix();this.renderer.setSize(width,height);
     this.composer?.setPixelRatio(this.renderer.getPixelRatio());this.composer?.setSize(width,height);
+    this.grade?.uniforms.uResolution.value.set(width*this.renderer.getPixelRatio(),height*this.renderer.getPixelRatio());
     this.dirty=true;
   }
   update(s,settings,cutaway) {
     if(s.time!==this.lastTime || cutaway!==this.lastCutaway || s.diameter!==this.current?.diameter || !this.initialWeather)this.dirty=true;
     this.lastCutaway=cutaway;
     this.current=s;
+    this.windUniform.value=s.time;this.skyUniforms.uFlash.value=0;
+    if(this.cameraView==='orbit'&&!this.followHail&&s.time!==this.lastTime){const angle=.48+s.time*.035;this.camera.position.set(Math.sin(angle)*24,5.2+Math.sin(s.time*.025)*1.3,Math.cos(angle)*24);this.dirty=true;}
     const p=s.position,r=s.stage===0?.12:.16+s.diameter/50*.44;
-    this.hail.position.set(p.x,p.y+.15,p.z);this.hail.scale.setScalar(r);
+    const groundY=this.groundHeight(p.x,p.z)+r+.015;
+    const bounce=s.stage===5?Math.abs(Math.sin(s.phase*Math.PI*3))*.38*Math.exp(-s.phase*6):0;
+    this.hail.position.set(p.x,Math.max(p.y+.15,groundY)+bounce,p.z);this.hail.scale.setScalar(r);
+    this.studio.position.copy(this.hail.position);
     if(this.followHail){const delta=this.hail.position.clone().sub(this.controls.target);this.controls.target.copy(this.hail.position);this.camera.position.add(delta);}
     this.hailCore.rotation.set(s.time*.29,s.time*.47,s.time*.12);this.bubbles.rotation.copy(this.hailCore.rotation);
-    this.iceMaterial.color.setHex(s.stage===0?0xb2dde9:0xd2e4ec);this.iceMaterial.transmission=s.stage===0?.87:.53;
+    this.iceMaterial.color.setHex(s.stage===0?0xb2dde9:0xe6f2f5);this.iceMaterial.transmission=s.stage===0?.87:.68;
     this.iceCracks.visible=s.stage>0;this.iceCracks.rotation.copy(this.hailCore.rotation);
     this.iceNucleus.visible=this.bubbles.visible=s.stage>0;this.hailHalo.quaternion.copy(this.camera.quaternion);
     this.hailHalo.visible=!this.followHail;
@@ -230,11 +247,13 @@ export class StormScene {
     this.cloudUniforms.uTime.value=s.time;
     const flash=s.stage>=2&&s.stage<5&&(Math.floor(s.time*8)%83===0||Math.floor(s.time*8)%83===2)?1:0;
     this.cloudUniforms.uFlash.value=flash;this.flashLight.intensity=flash*36;this.lightning.visible=Boolean(flash);
+    this.skyUniforms.uFlash.value=flash;this.water.material.uniforms.uTime.value=s.time;this.water.material.uniforms.uFlash.value=flash;
+    this.spray.material.uniforms.uTime.value=s.time;this.spray.material.uniforms.uFlash.value=flash;
+    this.rain.material.uniforms.uTime.value=s.time;this.rain.material.uniforms.uFlash.value=flash;
+    this.mist.forEach((sprite,i)=>{sprite.position.x=Math.sin(s.time*.09+i*2)*3+1;sprite.material.opacity=.07+Math.sin(s.time*.2+i)*.025;});
     // All weather uses simulation time, so pausing freezes clouds, rain and lightning.
     if(s.time!==this.lastTime || !this.initialWeather) {
       this.initialWeather=true;
-      for(let i=0;i<this.profile.particles;i++){const q=this.weatherSeeds[i],y=.13+((q.phase-s.time*.22)%1+1)%1*8.5,x=q.x*.57+2+Math.sin(s.time*.04+q.phase*5)*.15,k=i*6;this.rainBuffer[k]=x;this.rainBuffer[k+1]=y;this.rainBuffer[k+2]=q.z;this.rainBuffer[k+3]=x+.035;this.rainBuffer[k+4]=Math.max(.06,y-q.length);this.rainBuffer[k+5]=q.z+.016;}
-      this.rainGeo.attributes.position.needsUpdate=true;
       for(let i=0;i<180;i++){const q=this.weatherSeeds[i+200];dummy.position.set(q.x*.65+1.2,.1+((q.phase-s.time*.15)%1+1)%1*7,q.z*.65);dummy.scale.setScalar(.018+(i%7)*.006);dummy.rotation.set(s.time+i,s.time*.3,0);dummy.updateMatrix();this.smallHail.setMatrixAt(i,dummy.matrix);}this.smallHail.instanceMatrix.needsUpdate=true;
     }
     this.smallHail.visible=s.stage>=2;
@@ -244,6 +263,7 @@ export class StormScene {
     if(s.time!==this.lastTime){if(this.trailCount===180){this.trailBuffer.copyWithin(0,3);this.trailCount=179;}const i=this.trailCount++*3;this.trailBuffer[i]=p.x;this.trailBuffer[i+1]=p.y+.15;this.trailBuffer[i+2]=p.z;this.trailGeometry.attributes.position.needsUpdate=true;this.trailGeometry.setDrawRange(0,this.trailCount);this.trailGeometry.computeBoundingSphere();}
     this.lastTime=s.time;this.trail.material.color.setHex(s.stage>=4?0xf4ba96:0xafe3e4);
     this.cutaway.visible=cutaway&&s.stage>0;this.cutawayLabel.hidden=!this.cutaway.visible;this.cutaway.quaternion.copy(this.camera.quaternion);this.sectionMaterial.uniforms.uLayers.value=Math.max(1,s.layers);this.cutawayLabel.textContent=`โครงสร้างขยาย · ${s.layers} ชั้น`;
+    this.ao.enabled=this.profile.ao&&!this.followHail;
     this.projectLabel(this.hail.position,this.label,22,-24);this.projectLabel(this.cutaway.position,this.cutawayLabel,-68,63);
   }
   projectLabel(point,element,dx,dy){const p=point.clone().project(this.camera),x=(p.x*.5+.5)*this.width+dx,y=(-p.y*.5+.5)*this.height+dy;element.style.left=`${clamp(x,8,Math.max(8,this.width-element.offsetWidth-8))}px`;element.style.top=`${clamp(y,10,this.height-45)}px`;element.style.visibility=p.z>1?'hidden':'visible';}
@@ -260,5 +280,7 @@ export class StormScene {
     if(now-this.stats.since>=1200){this.stats.fps=Math.round(this.stats.frames*1000/(now-this.stats.since));this.stats.frames=0;this.stats.since=now;this.renderer.domElement.dataset.fps=String(this.stats.fps);}
     this.renderer.domElement.dataset.cloudReady=String(Boolean(this.cloudReady));
     this.renderer.domElement.dataset.frames=String((Number(this.renderer.domElement.dataset.frames)||0)+1);
+    this.renderer.domElement.dataset.cameraView=this.followHail?'closeup':this.cameraView;
+    this.renderer.domElement.dataset.weatherTime=String(this.current?.time||0);
   }
 }

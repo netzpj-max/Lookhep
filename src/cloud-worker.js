@@ -15,7 +15,7 @@ const lobes = [
 const clamp = x => Math.min(1,Math.max(0,x));
 
 self.onmessage = () => {
-  const width=128,height=160,depth=96;
+  const width=160,height=192,depth=112;
   const data=new Uint8Array(width*height*depth);
   let index=0;
   for(let z=0;z<depth;z++) for(let y=0;y<height;y++) for(let x=0;x<width;x++) {
@@ -23,15 +23,24 @@ self.onmessage = () => {
     let shape=-10;
     for(const l of lobes){const qx=(wx-l[0])/l[3],qy=(wy-l[1])/l[4],qz=(wz-l[2])/l[5];shape=Math.max(shape,1-Math.sqrt(qx*qx+qy*qy+qz*qz));}
     if(shape < -0.19 || wy < 1.9) { index++; continue; }
-    const a=noise.noise(wx*.7+13,wy*.7,wz*.7+5);
+    const warp=noise.noise(wx*.38+3,wy*.38,wz*.38)*.22;
+    const a=noise.noise(wx*.7+13+warp,wy*.7,wz*.7+5);
     const b=noise.noise(wx*1.6+50,wy*1.6+3,wz*1.6);
     const c=noise.noise(wx*3.7,wy*3.7+25,wz*3.7);
     const d=noise.noise(wx*8.1+7,wy*8.1,wz*8.1+19);
-    const turbulence=a*.25+b*.13+c*.055+d*.024;
-    const edge=clamp((shape+turbulence-.025)*4.6);
+    const turbulence=a*.30+b*.22+c*.105+d*.045;
+    const edge=clamp((shape+turbulence-.018)*5.2);
     const bottom=clamp((wy-1.9)*2.6);
     const density=edge*bottom*(.63+a*.27+b*.13);
     data[index++]=Math.round(clamp(density)*255);
   }
-  self.postMessage({data,width,height,depth},[data.buffer]);
+  const detailSize=48,detail=new Uint8Array(detailSize**3);
+  let di=0;
+  // Integer periods make the erosion field tile seamlessly in all directions.
+  for(let z=0;z<detailSize;z++)for(let y=0;y<detailSize;y++)for(let x=0;x<detailSize;x++){
+    const px=x/detailSize*8,py=y/detailSize*8,pz=z/detailSize*8;
+    const value=noise.noise(px,py,pz)*.55+noise.noise(px*2,py*2,pz*2)*.28+noise.noise(px*4,py*4,pz*4)*.17;
+    detail[di++]=Math.round(clamp(value*.7+.5)*255);
+  }
+  self.postMessage({data,width,height,depth,detail,detailSize},[data.buffer,detail.buffer]);
 };
